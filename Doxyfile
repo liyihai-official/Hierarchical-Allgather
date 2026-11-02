@@ -1,0 +1,19 @@
+# Doxygen configuration for Allgather_radix_batch (only non-default settings).
+# usage:  doxygen Doxyfile      -> docs/html/index.html
+PROJECT_NAME           = "Allgather_radix_batch"
+PROJECT_BRIEF          = "分组、分批的 k 进制 Allgather"
+OUTPUT_DIRECTORY       = docs
+OUTPUT_LANGUAGE        = Chinese
+INPUT                  = Allgather_radix_batch.c Allgather_radix_batch.h
+INPUT_ENCODING         = UTF-8
+OPTIMIZE_OUTPUT_FOR_C  = YES
+# 文件内的 static 函数、结构体和变量也生成文档（本文件的大部分函数都是 static）
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = YES
+TYPEDEF_HIDES_STRUCT   = NO
+SOURCE_BROWSER         = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = YES
