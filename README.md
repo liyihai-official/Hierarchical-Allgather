@@ -6,7 +6,7 @@
 # 所有命令都在项目根目录运行
 make -j4
 
-# 查看自己在当前登录节点上的提交进程，以及 PBS 中的任务
+# 查看当前登录节点上的提交进程，以及 PBS 中的任务
 pgrep -u "$USER" -af '[s]ubmit_plan|[q]sub'
 qstat -u "$USER"
 
