@@ -919,7 +919,9 @@ static void gather_within_group(AllgatherRadixBatchContext* context,
   int normalized_rank = subtract_modulo(context->local_rank, root, group_size);
   int distance = 1;
 
-  memcpy(views->normalized_group + (size_t)normalized_rank * layout->record_bytes, local_record, layout->record_bytes);
+  memcpy(views->normalized_group + (size_t)normalized_rank * layout->record_bytes,
+         local_record,
+         layout->record_bytes);
 
   while (distance < group_size)
   {
