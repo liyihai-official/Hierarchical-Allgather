@@ -3,11 +3,14 @@
 //   bench_shm nodes=<n> ppn=<p> [b=<group size, default ppn>] [out=<csv>]
 //             [counts=1,2,4] [radices=2,4,8] [reps=<fixed reps>] [warmup=3]
 //             [max_seconds=<stop before the next configuration>] [inplace=1] [diag=1]
+//             [view=1: also run Allgather_shm_view] [read_pass=1: time one read of the result]
 //
 // Without reps=, the number of repetitions drops with size: 50 up to 1024 elements,
 // 20 up to 8192, then 10. Warmup calls absorb setup and first-use costs and are not logged.
 // time_barrier is the method of main.cc (rank 0, including a closing barrier); time_max is
-// the slowest rank's own duration without that barrier.
+// the slowest rank's own duration without that barrier. read_max is the slowest rank's time to
+// sum the whole result after a barrier: Allgather_shm_view skips a copy that other algorithms
+// pay for inside the call, so comparing them fairly needs the cost of using the result too.
 #include <mpi.h>
 
 #include <algorithm>
@@ -31,7 +34,8 @@ enum class Kind
 {
   MpiAllgather,
   RadixBatch,
-  NodeShm
+  NodeShm,
+  NodeView
 };
 
 struct Algorithm
@@ -49,6 +53,8 @@ struct Options
   int reps = 0;
   int inplace = 0;
   int diag = 0;
+  int view = 0;
+  int read_pass = 0;
   double max_seconds = 0;
   std::string out = "bench_shm.csv";
   std::vector<int> counts;
@@ -62,6 +68,7 @@ const char* name_of(Kind kind)
     case Kind::MpiAllgather: return "mpi_allgather";
     case Kind::RadixBatch: return "radix_batch";
     case Kind::NodeShm: return "node_shm";
+    case Kind::NodeView: return "node_view";
   }
   return "unknown";
 }
@@ -99,6 +106,8 @@ Options parse_options(int argc, char** argv)
     else if (key == "reps") options.reps = std::atoi(value);
     else if (key == "inplace") options.inplace = std::atoi(value);
     else if (key == "diag") options.diag = std::atoi(value);
+    else if (key == "view") options.view = std::atoi(value);
+    else if (key == "read_pass") options.read_pass = std::atoi(value);
     else if (key == "max_seconds") options.max_seconds = std::atof(value);
     else if (key == "out") options.out = value;
     else if (key == "counts") options.counts = parse_list(value);
@@ -125,8 +134,10 @@ int reps_for(const Options& options, int count)
   return 10;
 }
 
-int call(const Algorithm& algorithm, const void* send, int count, void* recv, int b)
+// Sets *result to where this call left the data.
+int call(const Algorithm& algorithm, const void* send, int count, int* recv, int b, const int** result)
 {
+  *result = recv;
   switch (algorithm.kind)
   {
     case Kind::MpiAllgather:
@@ -135,6 +146,13 @@ int call(const Algorithm& algorithm, const void* send, int count, void* recv, in
       return Allgather_radix_batch(send, count, MPI_INT, recv, MPI_COMM_WORLD, algorithm.k, b);
     case Kind::NodeShm:
       return Allgather_shm(send, count, MPI_INT, recv, MPI_COMM_WORLD, b);
+    case Kind::NodeView:
+    {
+      const void* shared = nullptr;
+      const int error = Allgather_shm_view(send, count, MPI_INT, &shared, MPI_COMM_WORLD, b);
+      *result = static_cast<const int*>(shared);
+      return error;
+    }
   }
   return MPI_ERR_OTHER;
 }
@@ -145,17 +163,18 @@ const double* stage_times(Kind kind)
   switch (kind)
   {
     case Kind::RadixBatch: return Allgather_radix_batch_stage_times;
-    case Kind::NodeShm: return Allgather_shm_stage_times;
+    case Kind::NodeShm:
+    case Kind::NodeView: return Allgather_shm_stage_times;
     default: return none;
   }
 }
 
 // Every element of the result equals its own index: rank * count + i.
-bool result_is_correct(const std::vector<int>& recv)
+bool result_is_correct(const int* result, size_t size)
 {
-  for (size_t i = 0; i < recv.size(); ++i)
+  for (size_t i = 0; i < size; ++i)
   {
-    if (recv[i] != static_cast<int>(i)) return false;
+    if (result[i] != static_cast<int>(i)) return false;
   }
   return true;
 }
@@ -183,7 +202,8 @@ void run_algorithm(const Algorithm& algorithm,
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double t0 = MPI_Wtime();
-    const int error = call(algorithm, send_arg, count, recv.data(), options.b);
+    const int* result = nullptr;
+    const int error = call(algorithm, send_arg, count, recv.data(), options.b, &result);
     const double local_time = MPI_Wtime() - t0;
     MPI_Barrier(MPI_COMM_WORLD);
     const double barrier_time = MPI_Wtime() - t0;
@@ -200,15 +220,28 @@ void run_algorithm(const Algorithm& algorithm,
       }
       return;
     }
+
+    // Warmup calls read too: the first read of a mapping takes page faults.
+    double read_time = 0;
+    long long read_sum = 0;
+    if (options.read_pass)
+    {
+      MPI_Barrier(MPI_COMM_WORLD);
+      const double t1 = MPI_Wtime();
+      read_sum = std::accumulate(result, result + recv.size(), 0LL);
+      read_time = MPI_Wtime() - t1;
+    }
     if (rep < 0) continue;
 
     const double* stages = stage_times(algorithm.kind);
-    const double local[4] = {local_time, stages[0], stages[1], stages[2]};
-    double maximum[4] = {0, 0, 0, 0};
+    const double local[5] = {local_time, stages[0], stages[1], stages[2], read_time};
+    double maximum[5] = {0, 0, 0, 0, 0};
     double sum[3] = {0, 0, 0};
-    const int correct = result_is_correct(recv) ? 1 : 0;
+    const long long elements = static_cast<long long>(recv.size());
+    const int correct = result_is_correct(result, recv.size()) &&
+                        (!options.read_pass || read_sum == elements * (elements - 1) / 2);
     int all_correct = 0;
-    MPI_Reduce(local, maximum, 4, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local, maximum, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(local + 1, sum, 3, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&correct, &all_correct, 1, MPI_INT, MPI_MIN, 0, MPI_COMM_WORLD);
 
@@ -218,7 +251,7 @@ void run_algorithm(const Algorithm& algorithm,
           << options.nodes << ',' << options.ppn << ',' << nprocs << ',' << count << ',' << rep << ','
           << barrier_time << ',' << maximum[0] << ',' << maximum[1] << ',' << maximum[2] << ','
           << maximum[3] << ',' << sum[0] / nprocs << ',' << sum[1] / nprocs << ',' << sum[2] / nprocs
-          << ',' << all_correct << '\n';
+          << ',' << all_correct << ',' << maximum[4] << '\n';
     }
   }
   if (rank == 0) csv.flush();
@@ -259,13 +292,14 @@ int main(int argc, char** argv)
     if (k >= 2 && k <= options.b) algorithms.push_back({Kind::RadixBatch, k});
   }
   algorithms.push_back({Kind::NodeShm, 0});
+  if (options.view) algorithms.push_back({Kind::NodeView, 0});
 
   std::ofstream csv;
   if (rank == 0)
   {
     csv.open(options.out);
     csv << "algorithm,k,b,nodes,ppn,nprocs,send_count,rep,time_barrier,time_max,"
-           "s1_max,s2_max,s3_max,s1_avg,s2_avg,s3_avg,is_correct\n";
+           "s1_max,s2_max,s3_max,s1_avg,s2_avg,s3_avg,is_correct,read_max\n";
     csv.precision(9);
   }
 

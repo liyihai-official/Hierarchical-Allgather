@@ -37,6 +37,9 @@ def summarize(rows, metric):
             "time": st.median(float(r[metric]) for r in group),
             "reps": len(group),
             "wrong": sum(1 for r in group if r["is_correct"] != "1"),
+            # The call plus one read of the whole result, repetition by repetition.
+            "with_read": st.median(float(r[metric]) + float(r.get("read_max") or 0) for r in group),
+            "read": st.median(float(r.get("read_max") or 0) for r in group),
             **{s: st.median(float(r[s]) for r in group) for s in STAGES},
         }
     return summary
@@ -101,6 +104,30 @@ def main():
             print("| elements | radix s1 | radix s2 | radix s3 | shm s1 | shm s2 | shm s3 |")
             print("|---:|---:|---:|---:|---:|---:|---:|")
             print("\n".join(stage_lines))
+        print_view_table(summary, nodes)
+
+
+def print_view_table(summary, nodes):
+    """node_view skips a copy other algorithms pay inside the call, so also compare call plus read."""
+    counts = sorted({key[1] for key in summary if key[0] == nodes and key[2] == "node_view"})
+    if not counts:
+        return
+    print("\nnode_view: the call alone, then the call plus one read of the whole result:")
+    print("| elements | bytes/rank | radix best | node_shm | node_view | view/radix | view/shm "
+          "| read radix | read shm | read view | radix+read | shm+read | view+read | view/radix | view/shm |")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for count in counts:
+        radix = [value for key, value in summary.items() if key[:3] == (nodes, count, "radix_batch")]
+        best = min(radix, key=lambda v: v["time"])
+        best_total = min(radix, key=lambda v: v["with_read"])
+        shm = summary[(nodes, count, "node_shm", 0)]
+        view = summary[(nodes, count, "node_view", 0)]
+        print("| %d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            count, count * 4, fmt(best["time"]), fmt(shm["time"]), fmt(view["time"]),
+            ratio(view["time"], best["time"]), ratio(view["time"], shm["time"]),
+            fmt(best_total["read"]), fmt(shm["read"]), fmt(view["read"]),
+            fmt(best_total["with_read"]), fmt(shm["with_read"]), fmt(view["with_read"]),
+            ratio(view["with_read"], best_total["with_read"]), ratio(view["with_read"], shm["with_read"])))
 
 
 if __name__ == "__main__":

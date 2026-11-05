@@ -31,14 +31,38 @@ extern "C"
     MPI_Comm comm,
     int ranks_per_node);
 
-  /* Collectively destroy every context created by Allgather_shm. */
+  /*
+   * Same exchange as Allgather_shm, without the final copy: *result points to the
+   * contributions of all ranks in rank order, in one buffer shared by the node.
+   * The requirements above apply. *result is NULL when the contributions are empty.
+   *
+   * This is not a drop-in MPI_Allgather:
+   * - the result is mapped read-only, so a write faults;
+   * - it stays valid until this process makes its next Allgather_shm or
+   *   Allgather_shm_view call for the same (comm, ranks_per_node), or calls
+   *   Allgather_shm_release_cached. To change or keep it, copy it first;
+   * - that next call waits for every process of the node to make its next call,
+   *   because the buffer is then reused;
+   * - sendbuf must not point into the previous result.
+   * MPI_IN_PLACE returns MPI_ERR_BUFFER and a NULL result returns MPI_ERR_ARG; neither
+   * communicates, so every rank must make the same mistake to get the same error.
+   */
+  int Allgather_shm_view(
+    const void* sendbuf,
+    int sendcount,
+    MPI_Datatype datatype,
+    const void** result,
+    MPI_Comm comm,
+    int ranks_per_node);
+
+  /* Collectively destroy every context created by Allgather_shm or Allgather_shm_view. */
   void Allgather_shm_release_cached(void);
 
   /*
    * Local seconds of the most recent call on this process:
    * [0] write to the shared buffer, and at the root wait for the whole node;
    * [1] send and receive group blocks across nodes;
-   * [2] wait for the whole node, then copy to recvbuf.
+   * [2] wait for the whole node, then copy to recvbuf (Allgather_shm_view only waits).
    */
   extern double Allgather_shm_stage_times[3];
 

@@ -25,5 +25,8 @@ Allgather_radix_batch_timed.o: Allgather_radix_batch.c Allgather_radix_batch.h
 
 Allgather_shm.o: Allgather_shm.c Allgather_shm.h
 
+test_shm_view: test_shm_view.cc Allgather_shm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
 clean:
-	rm -f $(TARGET) $(OBJS) bench_shm Allgather_radix_batch_timed.o Allgather_shm.o
+	rm -f $(TARGET) $(OBJS) bench_shm test_shm_view Allgather_radix_batch_timed.o Allgather_shm.o

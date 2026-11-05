@@ -17,6 +17,9 @@
  * 进程都完成了相应的一步，因此不需要复位。下一次调用开始时先等 copied 到位，这样较快的
  * 进程不会覆盖较慢的进程还在读的数据。
  *
+ * Allgather_shm_view() 不做第 3 步的拷贝，每个进程通过只读映射直接读 data。它的 copied
+ * 在该进程下一次调用开始时才加一，所以数据要等本节点所有进程都进入下一次调用才会被覆盖。
+ *
  * 缓冲区用 /dev/shm 文件映射，而不是 MPI_Win_allocate_shared：多节点时 MPICH 创建窗口会对
  * 整块内存做 NIC 注册，页面全部落在节点内 rank 0 所在的 NUMA 节点上，无法再安排位置。
  */
@@ -50,7 +53,7 @@ typedef struct
 {
   _Alignas(64) atomic_ullong written;   ///< 第 1 步：已写入 data 的进程累计数
   _Alignas(64) atomic_ullong received;  ///< 第 2 步：已完成跨节点收发的进程累计数
-  _Alignas(64) atomic_ullong copied;    ///< 第 3 步：已拷到 recvbuf 的进程累计数
+  _Alignas(64) atomic_ullong copied;    ///< 第 3 步：已不再读取 data 的进程累计数
 } NodeCounters;
 
 /** @brief 一个 (comm, B) 对应的上下文。 */
@@ -64,6 +67,9 @@ typedef struct AllgatherShmContext
   size_t mapping_bytes;              ///< 共享映射的字节数
   NodeCounters* counters;            ///< 映射内的计数器（第一页）
   unsigned char* data;               ///< 映射内的数据区（第二页起）
+  unsigned char* read_only_mapping;  ///< 同一块内存的只读映射的首地址
+  const unsigned char* read_only_data; ///< 只读映射内的数据区，交给 Allgather_shm_view() 的调用者
+  int result_held;                   ///< 非 0 表示本进程还持有上一次 Allgather_shm_view() 的结果
   size_t capacity_bytes;             ///< data 的容量（字节）
   size_t record_bytes;               ///< m：每个进程贡献的字节数
   size_t group_bytes;                ///< 组块字节数 = B × m
@@ -139,17 +145,31 @@ static int is_dense_type(MPI_Datatype type)
   return lower_bound == 0 && true_lower_bound == 0 && extent == bytes && true_extent == bytes;
 }
 
+/** @brief 本进程不再读上一次 Allgather_shm_view() 的结果，此后 data 可以被覆盖。 */
+static void release_result(AllgatherShmContext* context)
+{
+  if (context->result_held)
+  {
+    context->result_held = 0;
+    atomic_fetch_add_explicit(&context->counters->copied, 1, memory_order_release);
+  }
+}
+
 /** @brief 释放共享映射。集合操作；等本节点所有进程都读完上一次调用的数据。 */
 static void free_shared(AllgatherShmContext* context)
 {
   if (context->mapping != NULL)
   {
+    release_result(context);
     spin_until(context,
                &context->counters->copied,
                context->call_index * (unsigned long long)context->ranks_per_node);
     require_ok(context->comm, MPI_Barrier(context->node_comm));
     munmap(context->mapping, context->mapping_bytes);
+    munmap(context->read_only_mapping, context->mapping_bytes);
     context->mapping = NULL;
+    context->read_only_mapping = NULL;
+    context->read_only_data = NULL;
     context->counters = NULL;
     context->data = NULL;
     context->capacity_bytes = 0;
@@ -260,13 +280,15 @@ static void allocate_shared(AllgatherShmContext* context, size_t data_bytes)
   }
   context->mapping =
     mmap(NULL, context->mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  context->read_only_mapping = mmap(NULL, context->mapping_bytes, PROT_READ, MAP_SHARED, fd, 0);
   close(fd);
-  if (context->mapping == MAP_FAILED)
+  if (context->mapping == MAP_FAILED || context->read_only_mapping == MAP_FAILED)
   {
     require_ok(context->comm, MPI_ERR_NO_MEM);
   }
   context->counters = (NodeCounters*)context->mapping;
   context->data = context->mapping + page_bytes;
+  context->read_only_data = context->read_only_mapping + page_bytes;
   context->capacity_bytes = data_bytes;
   context->call_index = 0;
 
@@ -392,17 +414,20 @@ static void distribute(AllgatherShmContext* context)
   }
 }
 
-/** @brief 执行一次已绑定的 Allgather，步骤见文件开头。 */
-static void execute(AllgatherShmContext* context, const void* sendbuf, void* recvbuf)
+/**
+ * @brief 第 1、2 步，以及第 3 步开头的等待：返回时本节点的 data 已经完整。
+ * @return 本进程完成第 2 步的时刻，第 3 步的耗时从这里算起。
+ */
+static double exchange(AllgatherShmContext* context, const void* own_data)
 {
   NodeCounters* counters = context->counters;
   unsigned long long node_ranks = (unsigned long long)context->ranks_per_node;
   size_t own_offset = (size_t)context->rank * context->record_bytes;
-  const void* own_data = sendbuf == MPI_IN_PLACE ? (const unsigned char*)recvbuf + own_offset : sendbuf;
   unsigned long long target;
-  double t0, t1, t2, t3;
+  double t0, t1, t2;
 
   t0 = MPI_Wtime();
+  release_result(context);
   spin_until(context, &counters->copied, context->call_index * node_ranks);
   target = ++context->call_index * node_ranks;
 
@@ -419,21 +444,17 @@ static void execute(AllgatherShmContext* context, const void* sendbuf, void* rec
   t2 = MPI_Wtime();
 
   spin_until(context, &counters->received, target);
-  memcpy(recvbuf, context->data, context->data_bytes);
-  atomic_fetch_add_explicit(&counters->copied, 1, memory_order_release);
-  t3 = MPI_Wtime();
-
   Allgather_shm_stage_times[0] = t1 - t0;
   Allgather_shm_stage_times[1] = t2 - t1;
-  Allgather_shm_stage_times[2] = t3 - t2;
+  return t2;
 }
 
-int Allgather_shm(const void* sendbuf,
-                  int sendcount,
-                  MPI_Datatype datatype,
-                  void* recvbuf,
-                  MPI_Comm comm,
-                  int ranks_per_node)
+/** @brief 找到或创建 (comm, B) 的上下文，并绑定个数和类型。 */
+static int bind_context(int sendcount,
+                        MPI_Datatype datatype,
+                        MPI_Comm comm,
+                        int ranks_per_node,
+                        AllgatherShmContext** result)
 {
   AllgatherShmContext* context = cached_contexts;
   int error;
@@ -462,9 +483,69 @@ int Allgather_shm(const void* sendbuf,
       return error;
     }
   }
+  *result = context;
+  return MPI_SUCCESS;
+}
+
+int Allgather_shm(const void* sendbuf,
+                  int sendcount,
+                  MPI_Datatype datatype,
+                  void* recvbuf,
+                  MPI_Comm comm,
+                  int ranks_per_node)
+{
+  AllgatherShmContext* context;
+  int error = bind_context(sendcount, datatype, comm, ranks_per_node, &context);
+
+  if (error != MPI_SUCCESS)
+  {
+    return error;
+  }
   if (context->data_bytes > 0)
   {
-    execute(context, sendbuf, recvbuf);
+    size_t own_offset = (size_t)context->rank * context->record_bytes;
+    const void* own_data =
+      sendbuf == MPI_IN_PLACE ? (const unsigned char*)recvbuf + own_offset : sendbuf;
+    double exchanged = exchange(context, own_data);
+
+    memcpy(recvbuf, context->data, context->data_bytes);
+    atomic_fetch_add_explicit(&context->counters->copied, 1, memory_order_release);
+    Allgather_shm_stage_times[2] = MPI_Wtime() - exchanged;
+  }
+  return MPI_SUCCESS;
+}
+
+int Allgather_shm_view(const void* sendbuf,
+                       int sendcount,
+                       MPI_Datatype datatype,
+                       const void** result,
+                       MPI_Comm comm,
+                       int ranks_per_node)
+{
+  AllgatherShmContext* context;
+  int error;
+
+  if (sendbuf == MPI_IN_PLACE)
+  {
+    return MPI_ERR_BUFFER;
+  }
+  if (result == NULL)
+  {
+    return MPI_ERR_ARG;
+  }
+  *result = NULL;
+  error = bind_context(sendcount, datatype, comm, ranks_per_node, &context);
+  if (error != MPI_SUCCESS)
+  {
+    return error;
+  }
+  if (context->data_bytes > 0)
+  {
+    double exchanged = exchange(context, sendbuf);
+
+    context->result_held = 1;
+    Allgather_shm_stage_times[2] = MPI_Wtime() - exchanged;
+    *result = context->read_only_data;
   }
   return MPI_SUCCESS;
 }
