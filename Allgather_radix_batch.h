@@ -117,6 +117,11 @@ extern "C"
   /* Collectively destroy every context cached by Allgather_radix_batch. */
   void Allgather_radix_batch_release_cached(void);
 
+#ifdef ALLGATHER_STAGE_TIMING
+  /* Local seconds of stages 1, 2 and 3 in the most recent prepared call on this process. */
+  extern double Allgather_radix_batch_stage_times[3];
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -50,6 +50,22 @@ enum
 _Static_assert(CHAR_BIT == 8, "The record length encoding requires 8-bit bytes");
 _Static_assert(INT_MAX <= UINT32_MAX, "The record header must hold an MPI int count");
 
+/* 分阶段计时只在定义 ALLGATHER_STAGE_TIMING 时编译进来，默认构建不受影响。 */
+#ifdef ALLGATHER_STAGE_TIMING
+double Allgather_radix_batch_stage_times[3];
+#define STAGE_TIMER_START(timer) double timer = MPI_Wtime()
+#define STAGE_TIMER_LAP(timer, stage)                                 \
+  do                                                                  \
+  {                                                                   \
+    double lap_end = MPI_Wtime();                                     \
+    Allgather_radix_batch_stage_times[stage] = lap_end - (timer);     \
+    (timer) = lap_end;                                                \
+  } while (0)
+#else
+#define STAGE_TIMER_START(timer) ((void)0)
+#define STAGE_TIMER_LAP(timer, stage) ((void)0)
+#endif
+
 /**
  * @brief 上下文持有的工作区：一块只增不减的字节缓冲区和一个请求数组。
  *
@@ -1704,8 +1720,11 @@ static int execute_prepared(AllgatherRadixBatchContext* context,
                         recvtype));
     local_record = views.local_record;
   }
+  STAGE_TIMER_START(stage_timer);
   gather_within_group(context, layout, &views, local_record);
+  STAGE_TIMER_LAP(stage_timer, 0);
   distribute_group_blocks(context, layout, &views, recvbuf);
+  STAGE_TIMER_LAP(stage_timer, 1);
   while (batch_begin < context->group_count)
   {
     int batch_groups = min_int(context->ranks_per_group, context->group_count - batch_begin);
@@ -1732,6 +1751,7 @@ static int execute_prepared(AllgatherRadixBatchContext* context,
     batch_begin += batch_groups;
     ++batch_index;
   }
+  STAGE_TIMER_LAP(stage_timer, 2);
   return MPI_SUCCESS;
 }
 
